@@ -3,9 +3,12 @@ function LBM_Imaging_Planner()
     maxResonantAmplitude = 576; % microns
     flytoTime = 3; % milliseconds
     objectiveResolution = 160; % microns per degree
+    brightGreen = [0 1 0]; % Define the custom bright green color
     
     % Global graphical objects & State (Synced across tabs)
     hasRealImage = false;
+    currentImgData = []; % Stores the actual image matrix
+    
     winROI = [];
     fovROI = [];
     scalebarLine = [];
@@ -29,6 +32,7 @@ function LBM_Imaging_Planner()
     title(ax, 'Image View');
     imagesc(ax, peaks(50)); % Placeholder
     axis(ax, 'image');
+    ax.XTickLabel = []; ax.YTickLabel = []; xlabel(ax, ''); ylabel(ax, '');
     
     % Sub-grid for buttons beneath the axes
     btnGrid = uigridlayout(leftGrid, [2 3]);
@@ -44,7 +48,7 @@ function LBM_Imaging_Planner()
     uilabel(bgVisualMode, 'Text', 'Orientation:', 'Position', [0 4 70 22]);
     rbWF = uiradiobutton(bgVisualMode, 'Text', 'WF', 'Position', [70 4 45 22]);
     rbSI = uiradiobutton(bgVisualMode, 'Text', 'SI', 'Position', [115 4 45 22]);
-    bgVisualMode.SelectionChangedFcn = @(~,~) visualModeChanged();
+    bgVisualMode.SelectionChangedFcn = @visualModeChanged;
     
     % Action Buttons
     btnLoad = uibutton(btnGrid, 'Text', 'Load Image...', 'ButtonPushedFcn', @loadImageCallback);
@@ -80,11 +84,9 @@ function LBM_Imaging_Planner()
             ctrls.pixelsPerLine = 512; % Default for Meso
         end
         
-        % Unified grid layout
         tGrid = uigridlayout(targetTab, [7 1]);
         tGrid.RowHeight = {50, 70, 70, 60, 40, '1x', 40}; 
         
-        % 1. Text boxes side-by-side
         boxGrid = uigridlayout(tGrid, [2 2]);
         boxGrid.Padding = [0 0 0 0]; 
         boxGrid.RowHeight = {'fit', 'fit'};
@@ -98,7 +100,6 @@ function LBM_Imaging_Planner()
         ctrls.edtWinSize = uieditfield(boxGrid, 'numeric', 'Value', 5);
         ctrls.edtWinSize.ValueChangedFcn = @(s, e) sharedWinSizeChanged(e.Value); 
         
-        % 2. Pixel Size (Slider + Edit Box)
         pixGrid = uigridlayout(tGrid, [2 2]);
         pixGrid.Padding = [0 0 0 0];
         pixGrid.RowHeight = {'fit', 'fit'};
@@ -116,7 +117,6 @@ function LBM_Imaging_Planner()
         ctrls.sldPix.ValueChangingFcn = @(s,e) pixelSizeChanging(ctrls.edtPix, e.Value);
         ctrls.edtPix.ValueChangedFcn = @(s,e) pixelSizeChanged(ctrls.sldPix, e.Value);
         
-        % 3. Frame Rate (Slider + Edit Box)
         frameGrid = uigridlayout(tGrid, [2 2]);
         frameGrid.Padding = [0 0 0 0];
         frameGrid.RowHeight = {'fit', 'fit'};
@@ -132,14 +132,12 @@ function LBM_Imaging_Planner()
         ctrls.sldFrame.ValueChangedFcn = @(s,e) frameRateChanged(ctrls.edtFrame, e.Value);
         ctrls.edtFrame.ValueChangedFcn = @(s,e) frameRateChanged(ctrls.sldFrame, e.Value);
         
-        % 4. FOV Coverage Mode (Radio Buttons)
         ctrls.bgFOV = uibuttongroup(tGrid, 'Title', 'FOV Stripe Coverage');
         ctrls.bgFOV.SelectionChangedFcn = @(~,~) updateLimitsAndDraw();
         
         ctrls.optOptimal = uiradiobutton(ctrls.bgFOV, 'Text', 'Optimal', 'Position', [10 10 80 22]);
         ctrls.optRect = uiradiobutton(ctrls.bgFOV, 'Text', 'Rectangular', 'Position', [100 10 100 22]);
         
-        % 5. Pixels Per Line Parameter
         dropGrid = uigridlayout(tGrid, [1 2]);
         dropGrid.Padding = [0 0 0 0];
         dropGrid.ColumnWidth = {'fit', '1x'};
@@ -152,15 +150,17 @@ function LBM_Imaging_Planner()
             uilabel(dropGrid, 'Text', num2str(ctrls.pixelsPerLine));
         end
         
-        % 6. Export to ScanImage Button (Bottom Right)
-        exportGrid = uigridlayout(tGrid, [1 2]);
-        exportGrid.Padding = [0 0 0 0];
-        exportGrid.Layout.Row = length(tGrid.RowHeight);
-        exportGrid.Layout.Column = 1;
-        exportGrid.ColumnWidth = {'1x', '1x'}; 
+        % 6. Save, Load, and Export Buttons (Bottom Row)
+        actionGrid = uigridlayout(tGrid, [1 3]);
+        actionGrid.Padding = [0 0 0 0];
+        actionGrid.Layout.Row = length(tGrid.RowHeight);
+        actionGrid.Layout.Column = 1;
+        actionGrid.ColumnWidth = {'1x', '1x', '1.5x'}; 
         
-        ctrls.btnExport = uibutton(exportGrid, 'Text', 'Export to *.roi file...', 'ButtonPushedFcn', @exportROICallback);
-        ctrls.btnExport.Layout.Column = 2; 
+        ctrls.btnLoadState = uibutton(actionGrid, 'Text', 'Load', 'ButtonPushedFcn', @loadStateCallback);
+        ctrls.btnSaveState = uibutton(actionGrid, 'Text', 'Save', 'ButtonPushedFcn', @saveStateCallback);
+        % FIX: Wrap the handle in an anonymous function so it reliably binds to the nested exportROICallback
+        ctrls.btnExport = uibutton(actionGrid, 'Text', 'Export to *.roi file...', 'ButtonPushedFcn', @(~,~) exportROICallback());
     end
 
     function sharedWinSizeChanged(val)
@@ -227,15 +227,346 @@ function LBM_Imaging_Planner()
     function formatSlider(sld)
         t = linspace(sld.Limits(1), sld.Limits(2), 5);
         sld.MajorTicks = t;
-        
         lbls = arrayfun(@(x) sprintf('%.1f', x), t, 'UniformOutput', false);
         lbls = regexprep(lbls, '\.0$', '');
-        
         sld.MajorTickLabels = lbls;
     end
 
+    %% --- IMAGE LOADING & PREPROCESSING ---
+    function loadImageCallback(~, ~)
+        [fileName, pathName] = uigetfile({'*.png;*.jpg;*.jpeg;*.tif;*.tiff;*.bmp', 'Image Files'}, 'Select an Image');
+        if isequal(fileName, 0), return; end
+        
+        fullFilePath = fullfile(pathName, fileName);
+        try
+            img = imread(fullFilePath);
+        catch
+            uialert(fig, 'Could not read the selected image file.', 'Error');
+            return;
+        end
+        
+        % Step 1: Initial Crop
+        cropFig = figure('Name', 'Initial Crop - Double click to confirm', 'NumberTitle', 'off', 'MenuBar', 'none');
+        figure(cropFig);
+        cropAx = axes(cropFig);
+        imshow(img, 'Parent', cropAx);
+        title(cropAx, 'Draw a rectangle and double-click inside it to confirm initial crop');
+        
+        croppedImg = imcrop(cropAx);
+        if ishandle(cropFig), close(cropFig); end
+        drawnow;
+        
+        if isempty(croppedImg)
+            return; % Cancelled
+        end
+        
+        % Step 2: Transform and Additional Crop UI
+        tempFig = uifigure('Name', 'Pre-process Image', 'Position', [200 200 700 750]);
+        drawnow;
+        figure(tempFig); % Force focus to the pre-process UI
+        
+        tGrid = uigridlayout(tempFig, [3 1]);
+        tGrid.RowHeight = {'1x', 40, 40};
+        
+        tAx = uiaxes(tGrid);
+        
+        baseImg = croppedImg;
+        currentTransformedImg = baseImg;
+        imshow(currentTransformedImg, 'Parent', tAx);
+        title(tAx, 'Adjust orientation. Click "Crop Again" if needed.');
+        
+        bGrid = uigridlayout(tGrid, [1 5]);
+        bGrid.Padding = [0 0 0 0];
+        uibutton(bGrid, 'Text', 'Rot 90° CCW', 'ButtonPushedFcn', @(~,~) doRot90());
+        uibutton(bGrid, 'Text', 'Flip H', 'ButtonPushedFcn', @(~,~) doFlipH());
+        uibutton(bGrid, 'Text', 'Flip V', 'ButtonPushedFcn', @(~,~) doFlipV());
+        uibutton(bGrid, 'Text', 'Crop Again', 'ButtonPushedFcn', @(~,~) doCropAgain());
+        uibutton(bGrid, 'Text', 'Load into GUI', 'ButtonPushedFcn', @(~,~) doDone());
+        
+        sGrid = uigridlayout(tGrid, [1 2]);
+        sGrid.Padding = [0 0 0 0];
+        sGrid.ColumnWidth = {120, '1x'};
+        uilabel(sGrid, 'Text', 'Arbitrary Rotate:');
+        sldRot = uislider(sGrid, 'Limits', [-180 180], 'Value', 0);
+        sldRot.ValueChangingFcn = @(s,e) doArbRot(e.Value);
+        sldRot.ValueChangedFcn = @(s,e) doArbRot(e.Value);
+        
+        finalOutputImg = [];
+        uiwait(tempFig);
+        
+        if isempty(finalOutputImg)
+            return; % Escaped
+        end
+        
+        % Load into main GUI
+        currentImgData = finalOutputImg;
+        imshow(currentImgData, 'Parent', ax);
+        title(ax, fileName, 'Interpreter', 'none');
+        
+        hasRealImage = true;
+        
+        % Clean up previous graphics
+        if ~isempty(winROI) && isvalid(winROI), delete(winROI); end
+        if ~isempty(fovROI) && isvalid(fovROI), delete(fovROI); end
+        if ~isempty(scalebarLine) && isvalid(scalebarLine), delete(scalebarLine); end
+        if ~isempty(scalebarText) && isvalid(scalebarText), delete(scalebarText); end
+        if ~isempty(compassLines), delete(compassLines(isvalid(compassLines))); end
+        if ~isempty(compassTexts), delete(compassTexts(isvalid(compassTexts))); end
+        
+        winROI = []; fovROI = []; scalebarLine = []; scalebarText = [];
+        compassLines = gobjects(0); compassTexts = gobjects(0);
+        
+        validStripesLBM = ctrlsLBM.stripeHandles(isvalid(ctrlsLBM.stripeHandles));
+        if ~isempty(validStripesLBM), delete(validStripesLBM); end
+        ctrlsLBM.stripeHandles = gobjects(0);
+        
+        validStripesMeso = ctrlsMeso.stripeHandles(isvalid(ctrlsMeso.stripeHandles));
+        if ~isempty(validStripesMeso), delete(validStripesMeso); end
+        ctrlsMeso.stripeHandles = gobjects(0);
+        
+        btnDefWin.Text = 'Define Window';
+        btnDefWin.Enable = 'on';
+        btnDrawFOV.Text = 'Draw FOV';
+        btnDrawFOV.Enable = 'off'; 
+        rbWF.Value = true;
+        camup(ax, [0 -1 0]); 
+        
+        ax.XTickLabel = []; ax.YTickLabel = []; xlabel(ax, ''); ylabel(ax, '');
+        updateAxesAndScale();
+        
+        % --- Transform Helper ---
+        function outImg = padRotate(bImg, rotVal)
+            outImg = imrotate(bImg, rotVal, 'bilinear', 'loose');
+            validMask = imrotate(true(size(bImg,1), size(bImg,2)), rotVal, 'bilinear', 'loose');
+            
+            if isfloat(bImg)
+                pVal = 1;
+            elseif islogical(bImg)
+                pVal = true;
+            else
+                pVal = intmax(class(bImg));
+            end
+            
+            if ndims(outImg) == 3
+                for ch = 1:size(outImg, 3)
+                    channel = outImg(:,:,ch);
+                    channel(~validMask) = pVal;
+                    outImg(:,:,ch) = channel;
+                end
+            else
+                outImg(~validMask) = pVal;
+            end
+        end
+        
+        % --- Transform Callbacks ---
+        function doRot90()
+            baseImg = rot90(baseImg);
+            currentTransformedImg = padRotate(baseImg, sldRot.Value);
+            imshow(currentTransformedImg, 'Parent', tAx);
+            title(tAx, 'Adjust orientation. Click "Crop Again" if needed.');
+        end
+        function doFlipH()
+            baseImg = fliplr(baseImg);
+            currentTransformedImg = padRotate(baseImg, sldRot.Value);
+            imshow(currentTransformedImg, 'Parent', tAx);
+            title(tAx, 'Adjust orientation. Click "Crop Again" if needed.');
+        end
+        function doFlipV()
+            baseImg = flipud(baseImg);
+            currentTransformedImg = padRotate(baseImg, sldRot.Value);
+            imshow(currentTransformedImg, 'Parent', tAx);
+            title(tAx, 'Adjust orientation. Click "Crop Again" if needed.');
+        end
+        function doArbRot(val)
+            currentTransformedImg = padRotate(baseImg, val);
+            imshow(currentTransformedImg, 'Parent', tAx);
+            title(tAx, 'Adjust orientation. Click "Crop Again" if needed.');
+        end
+        function doCropAgain()
+            cFig = figure('Name', 'Crop Again - Double click to confirm', 'NumberTitle', 'off', 'MenuBar', 'none');
+            figure(cFig);
+            cAx = axes(cFig);
+            imshow(currentTransformedImg, 'Parent', cAx);
+            title(cAx, 'Draw a rectangle and double-click inside it to confirm crop');
+            
+            cImg = imcrop(cAx);
+            if ishandle(cFig), close(cFig); end
+            drawnow;
+            
+            if ~isempty(cImg)
+                baseImg = cImg;
+                sldRot.Value = 0;
+                currentTransformedImg = baseImg;
+                imshow(currentTransformedImg, 'Parent', tAx);
+            end
+            title(tAx, 'Adjust orientation. Click "Crop Again" if needed.');
+            figure(tempFig); % Force focus back to the transform UI
+        end
+        function doDone()
+            finalOutputImg = currentTransformedImg;
+            uiresume(tempFig);
+            delete(tempFig);
+        end
+    end
+
+    %% --- SAVE / LOAD STATE ---
+    function saveStateCallback(~, ~)
+        [file, path] = uiputfile({'*.mat', 'MATLAB Files (*.mat)'}, 'Save App State', 'AppState.mat');
+        if isequal(file, 0), return; end
+        fullPath = fullfile(path, file);
+        
+        S = struct();
+        S.hasRealImage = hasRealImage;
+        S.currentImgData = currentImgData;
+        S.visualMode = bgVisualMode.SelectedObject.Text;
+        S.tabTitle = tabGroup.SelectedTab.Title;
+        S.axesTitle = ax.Title.String; 
+        
+        if ~isempty(winROI) && isvalid(winROI)
+            S.winROI.Center = winROI.Center;
+            S.winROI.Radius = winROI.Radius;
+        end
+        
+        if ~isempty(fovROI) && isvalid(fovROI)
+            S.fovROI.Type = class(fovROI);
+            if isprop(fovROI, 'Position'), S.fovROI.Position = fovROI.Position; end
+            if isprop(fovROI, 'Vertices'), S.fovROI.Vertices = fovROI.Vertices; end
+            if isprop(fovROI, 'Center')
+                S.fovROI.Center = fovROI.Center;
+                S.fovROI.SemiAxes = fovROI.SemiAxes;
+                S.fovROI.RotationAngle = fovROI.RotationAngle;
+            end
+        end
+        
+        S.LBM.resFreq = ctrlsLBM.edtResFreq.Value;
+        S.LBM.winSize = ctrlsLBM.edtWinSize.Value;
+        S.LBM.pixSize = ctrlsLBM.edtPix.Value;
+        S.LBM.frameRate = ctrlsLBM.edtFrame.Value;
+        S.LBM.fovMode = ctrlsLBM.bgFOV.SelectedObject.Text;
+        
+        S.Meso.resFreq = ctrlsMeso.edtResFreq.Value;
+        S.Meso.winSize = ctrlsMeso.edtWinSize.Value;
+        S.Meso.pixSize = ctrlsMeso.edtPix.Value;
+        S.Meso.frameRate = ctrlsMeso.edtFrame.Value;
+        S.Meso.fovMode = ctrlsMeso.bgFOV.SelectedObject.Text;
+        S.Meso.ddPixels = ctrlsMeso.ddPixels.Value;
+        
+        try
+            save(fullPath, 'S');
+            uialert(fig, 'App state saved successfully.', 'Success');
+        catch ME
+            uialert(fig, ['Error saving state: ' ME.message], 'Error');
+        end
+    end
+
+    function loadStateCallback(~, ~)
+        [file, path] = uigetfile({'*.mat', 'MATLAB Files (*.mat)'}, 'Load App State');
+        if isequal(file, 0), return; end
+        fullPath = fullfile(path, file);
+        
+        try
+            data = load(fullPath);
+            S = data.S;
+            
+            if ~isempty(winROI) && isvalid(winROI), delete(winROI); end
+            if ~isempty(fovROI) && isvalid(fovROI), delete(fovROI); end
+            clearStripes();
+            winROI = []; fovROI = [];
+            
+            hasRealImage = S.hasRealImage;
+            currentImgData = S.currentImgData;
+            
+            if hasRealImage && ~isempty(currentImgData)
+                imshow(currentImgData, 'Parent', ax);
+                if isfield(S, 'axesTitle')
+                    title(ax, S.axesTitle, 'Interpreter', 'none');
+                end
+                btnDefWin.Enable = 'on';
+            else
+                imagesc(ax, peaks(50));
+                axis(ax, 'image');
+                title(ax, 'Image View');
+                btnDefWin.Enable = 'off';
+                btnDrawFOV.Enable = 'off';
+            end
+            ax.XTickLabel = []; ax.YTickLabel = []; xlabel(ax, ''); ylabel(ax, '');
+            
+            if strcmp(S.visualMode, 'SI')
+                bgVisualMode.SelectedObject = rbSI;
+                camup(ax, [1 0 0]);
+            else
+                bgVisualMode.SelectedObject = rbWF;
+                camup(ax, [0 -1 0]);
+            end
+            
+            ctrlsLBM.edtResFreq.Value = S.LBM.resFreq;
+            ctrlsLBM.edtWinSize.Value = S.LBM.winSize;
+            if strcmp(S.LBM.fovMode, 'Optimal'), ctrlsLBM.bgFOV.SelectedObject = ctrlsLBM.optOptimal;
+            else, ctrlsLBM.bgFOV.SelectedObject = ctrlsLBM.optRect; end
+            
+            ctrlsMeso.edtResFreq.Value = S.Meso.resFreq;
+            ctrlsMeso.edtWinSize.Value = S.Meso.winSize;
+            ctrlsMeso.ddPixels.Value = S.Meso.ddPixels;
+            pixelsPerLineChangedMeso(S.Meso.ddPixels); 
+            if strcmp(S.Meso.fovMode, 'Optimal'), ctrlsMeso.bgFOV.SelectedObject = ctrlsMeso.optOptimal;
+            else, ctrlsMeso.bgFOV.SelectedObject = ctrlsMeso.optRect; end
+            
+            ctrlsLBM.sldPix.Value = S.LBM.pixSize;
+            ctrlsLBM.edtPix.Value = S.LBM.pixSize;
+            ctrlsLBM.sldFrame.Value = S.LBM.frameRate;
+            ctrlsLBM.edtFrame.Value = S.LBM.frameRate;
+            
+            ctrlsMeso.sldPix.Value = S.Meso.pixSize;
+            ctrlsMeso.edtPix.Value = S.Meso.pixSize;
+            ctrlsMeso.sldFrame.Value = S.Meso.frameRate;
+            ctrlsMeso.edtFrame.Value = S.Meso.frameRate;
+            
+            if strcmp(S.tabTitle, 'LBM')
+                tabGroup.SelectedTab = tabLBM;
+            else
+                tabGroup.SelectedTab = tabMeso;
+            end
+            
+            % Restore Geometries (locked as confirmed)
+            if isfield(S, 'winROI')
+                winROI = drawcircle(ax, 'Center', S.winROI.Center, 'Radius', S.winROI.Radius, ...
+                                    'InteractionsAllowed', 'none', 'FaceAlpha', 0, 'Label', '');
+                addlistener(winROI, 'MovingROI', @(~,~) updateAxesAndScale());
+                addlistener(winROI, 'ROIClicked', @winROIClicked);
+                btnDefWin.Text = 'Edit Window';
+                btnDrawFOV.Enable = 'on';
+            else
+                btnDefWin.Text = 'Define Window';
+            end
+            
+            if isfield(S, 'fovROI')
+                if strcmp(S.fovROI.Type, 'images.roi.Rectangle')
+                    fovROI = drawrectangle(ax, 'Position', S.fovROI.Position, ...
+                                           'InteractionsAllowed', 'none', 'FaceAlpha', 0, 'Label', '');
+                elseif strcmp(S.fovROI.Type, 'images.roi.Ellipse')
+                    fovROI = drawellipse(ax, 'Center', S.fovROI.Center, 'SemiAxes', S.fovROI.SemiAxes, 'RotationAngle', S.fovROI.RotationAngle, ...
+                                         'InteractionsAllowed', 'none', 'FaceAlpha', 0, 'Label', '');
+                elseif strcmp(S.fovROI.Type, 'images.roi.Freehand')
+                    fovROI = drawfreehand(ax, 'Position', S.fovROI.Position, ...
+                                          'InteractionsAllowed', 'none', 'FaceAlpha', 0, 'Label', '');
+                end
+                
+                addlistener(fovROI, 'MovingROI', @(~,~) updateLimitsAndDraw());
+                addlistener(fovROI, 'ROIClicked', @fovROIClicked);
+                btnDrawFOV.Text = 'Edit FOV';
+            else
+                btnDrawFOV.Text = 'Draw FOV';
+            end
+            
+            updateAxesAndScale();
+            
+        catch ME
+            uialert(fig, ['Failed to load application state.' newline newline 'Error: ' ME.message], 'Load Error');
+        end
+    end
+
     %% --- SCANIMAGE EXPORT LOGIC ---
-    function exportROICallback(~, ~)
+    function exportROICallback()
         if isempty(winROI) || ~isvalid(winROI) || isempty(fovROI) || ~isvalid(fovROI)
             uialert(fig, 'Please define Window and FOV first before exporting.', 'Export Error');
             return;
@@ -278,6 +609,7 @@ function LBM_Imaging_Planner()
             sizeX_um = pos(4) * micronsPerPx;
             sizeY_um_raw = pos(3) * micronsPerPx;
             
+            % Enforce perfectly square pixels with an EVEN number of lines
             pixelsY = max(2, round((sizeY_um_raw / sizeX_um) * pixelsX));
             if mod(pixelsY, 2) ~= 0
                 pixelsY = pixelsY + 1;
@@ -324,133 +656,14 @@ function LBM_Imaging_Planner()
         end
     end
 
-    %% --- TAB SWITCHING CACHE LOGIC ---
-    function tabChangedCallback(oldTab, newTab)
-        if strcmp(oldTab.Title, 'LBM'), oldState = ctrlsLBM; else, oldState = ctrlsMeso; end
-        if strcmp(newTab.Title, 'LBM'), newState = ctrlsLBM; else, newState = ctrlsMeso; end
-        
-        validStripesOld = oldState.stripeHandles(isvalid(oldState.stripeHandles));
-        if ~isempty(validStripesOld), set(validStripesOld, 'Visible', 'off'); end
-        
-        validStripesNew = newState.stripeHandles(isvalid(newState.stripeHandles));
-        if ~isempty(validStripesNew), set(validStripesNew, 'Visible', 'on'); end
-        
-        updateAxesAndScale();
-    end
-    
     %% --- VISUAL MODE ROTATION LOGIC ---
-    function visualModeChanged()
+    function visualModeChanged(~, ~)
         if strcmp(bgVisualMode.SelectedObject.Text, 'WF')
             camup(ax, [0 -1 0]); 
         else
             camup(ax, [1 0 0]); 
         end
         updateAxesAndScale(); 
-    end
-
-    %% --- CALLBACK FUNCTIONS ---
-    function loadImageCallback(~, ~)
-        [fileName, pathName] = uigetfile({'*.png;*.jpg;*.jpeg;*.tif;*.tiff;*.bmp', 'Image Files'}, 'Select an Image');
-        if isequal(fileName, 0), return; end
-        
-        fullFilePath = fullfile(pathName, fileName);
-        try
-            img = imread(fullFilePath);
-        catch
-            uialert(fig, 'Could not read the selected image file.', 'Error');
-            return;
-        end
-        
-        % Open preprocessing figure before cropping
-        tempFig = figure('Name', 'Pre-process & Crop Image', 'NumberTitle', 'off', 'MenuBar', 'none', 'ToolBar', 'none', 'CloseRequestFcn', @(~,~) closeTempFig());
-        tempAx = axes('Parent', tempFig, 'Position', [0.05 0.2 0.9 0.75]);
-        imshow(img, 'Parent', tempAx);
-        title(tempAx, 'Rotate or Flip the image if needed, then click "Proceed to Crop"');
-        
-        uicontrol('Parent', tempFig, 'Style', 'pushbutton', 'String', 'Rotate 90° CCW', ...
-            'Units', 'normalized', 'Position', [0.05 0.05 0.2 0.1], ...
-            'Callback', @(~,~) rotateImg());
-        uicontrol('Parent', tempFig, 'Style', 'pushbutton', 'String', 'Flip Horizontally', ...
-            'Units', 'normalized', 'Position', [0.275 0.05 0.2 0.1], ...
-            'Callback', @(~,~) flipHImg());
-        uicontrol('Parent', tempFig, 'Style', 'pushbutton', 'String', 'Flip Vertically', ...
-            'Units', 'normalized', 'Position', [0.5 0.05 0.2 0.1], ...
-            'Callback', @(~,~) flipVImg());
-        uicontrol('Parent', tempFig, 'Style', 'pushbutton', 'String', 'Proceed to Crop', ...
-            'Units', 'normalized', 'Position', [0.725 0.05 0.225 0.1], ...
-            'Callback', @(~,~) cropImg());
-            
-        croppedImg = [];
-        uiwait(tempFig);
-        
-        if isempty(croppedImg)
-            return; % Escaped/Closed without cropping
-        end
-        
-        imshow(croppedImg, 'Parent', ax);
-        title(ax, fileName, 'Interpreter', 'none');
-        
-        % Set global state to un-hide the compass
-        hasRealImage = true;
-        
-        if ~isempty(winROI) && isvalid(winROI), delete(winROI); end
-        if ~isempty(fovROI) && isvalid(fovROI), delete(fovROI); end
-        if ~isempty(scalebarLine) && isvalid(scalebarLine), delete(scalebarLine); end
-        if ~isempty(scalebarText) && isvalid(scalebarText), delete(scalebarText); end
-        if ~isempty(compassLines), delete(compassLines(isvalid(compassLines))); end
-        if ~isempty(compassTexts), delete(compassTexts(isvalid(compassTexts))); end
-        
-        winROI = []; fovROI = []; scalebarLine = []; scalebarText = [];
-        compassLines = gobjects(0); compassTexts = gobjects(0);
-        
-        validStripesLBM = ctrlsLBM.stripeHandles(isvalid(ctrlsLBM.stripeHandles));
-        if ~isempty(validStripesLBM), delete(validStripesLBM); end
-        ctrlsLBM.stripeHandles = gobjects(0);
-        
-        validStripesMeso = ctrlsMeso.stripeHandles(isvalid(ctrlsMeso.stripeHandles));
-        if ~isempty(validStripesMeso), delete(validStripesMeso); end
-        ctrlsMeso.stripeHandles = gobjects(0);
-        
-        btnDefWin.Text = 'Define Window';
-        btnDefWin.Enable = 'on';
-        btnDrawFOV.Text = 'Draw FOV';
-        btnDrawFOV.Enable = 'off'; 
-        rbWF.Value = true;
-        camup(ax, [0 -1 0]); 
-        
-        ax.XTickLabel = []; ax.YTickLabel = []; xlabel(ax, ''); ylabel(ax, '');
-        
-        % Draw compass over freshly loaded image instantly
-        updateAxesAndScale();
-        
-        % --- Pre-processing Tool Callbacks ---
-        function rotateImg()
-            img = rot90(img);
-            imshow(img, 'Parent', tempAx);
-            title(tempAx, 'Rotate or Flip the image if needed, then click "Proceed to Crop"');
-        end
-        function flipHImg()
-            img = fliplr(img);
-            imshow(img, 'Parent', tempAx);
-            title(tempAx, 'Rotate or Flip the image if needed, then click "Proceed to Crop"');
-        end
-        function flipVImg()
-            img = flipud(img);
-            imshow(img, 'Parent', tempAx);
-            title(tempAx, 'Rotate or Flip the image if needed, then click "Proceed to Crop"');
-        end
-        function cropImg()
-            title(tempAx, 'Draw a rectangle and double-click inside it to confirm crop');
-            croppedImg = imcrop(tempAx);
-            if ishandle(tempFig)
-                uiresume(tempFig);
-                delete(tempFig);
-            end
-        end
-        function closeTempFig()
-            uiresume(tempFig);
-            delete(tempFig);
-        end
     end
 
     %% --- DEFINE WINDOW LOGIC ---
@@ -535,6 +748,7 @@ function LBM_Imaging_Planner()
         ticksY_mm = ceil(minY_mm/tickStepY)*tickStepY : tickStepY : floor(maxY_mm/tickStepY)*tickStepY;
         ax.YTick = centerPx(2) + ticksY_mm * pixelsPerMM;
         
+        % Strip numbers, preserve ticks only
         ax.XTickLabel = [];
         ax.YTickLabel = [];
         xlabel(ax, '');
@@ -557,18 +771,19 @@ function LBM_Imaging_Planner()
             xStart = xEnd - pixelsPerMM;
             yPos = ylims(2) - offset;
             
-            scalebarLine = line(ax, [xStart, xEnd], [yPos, yPos], 'Color', 'w', 'LineWidth', 3);
+            scalebarLine = line(ax, [xStart, xEnd], [yPos, yPos], 'Color', brightGreen, 'LineWidth', 3);
             scalebarText = text(ax, mean([xStart, xEnd]), yPos - (offset/3), '1 mm', ...
-                'Color', 'w', 'FontSize', 12, 'FontWeight', 'bold', ...
+                'Color', brightGreen, 'FontSize', 12, 'FontWeight', 'bold', ...
                 'HorizontalAlignment', 'center', 'VerticalAlignment', 'bottom');
         else
             xPos = xlims(1) + offset;
             yEnd = ylims(2) - offset;
             yStart = yEnd - pixelsPerMM;
             
-            scalebarLine = line(ax, [xPos, xPos], [yStart, yEnd], 'Color', 'w', 'LineWidth', 3);
+            scalebarLine = line(ax, [xPos, xPos], [yStart, yEnd], 'Color', brightGreen, 'LineWidth', 3);
+            
             scalebarText = text(ax, xPos - (offset/1.5), mean([yStart, yEnd]), '1 mm', ...
-                'Color', 'w', 'FontSize', 12, 'FontWeight', 'bold', ...
+                'Color', brightGreen, 'FontSize', 12, 'FontWeight', 'bold', ...
                 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
         end
     end
@@ -595,40 +810,40 @@ function LBM_Imaging_Planner()
             cx = xlims(1) + span;
             cy = ylims(1) + span;
             
-            l1 = line(ax, [cx-r, cx+r], [cy, cy], 'Color', 'w', 'LineWidth', 2);
-            l2 = line(ax, [cx, cx], [cy-r, cy+r], 'Color', 'w', 'LineWidth', 2);
+            l1 = line(ax, [cx-r, cx+r], [cy, cy], 'Color', brightGreen, 'LineWidth', 2);
+            l2 = line(ax, [cx, cx], [cy-r, cy+r], 'Color', brightGreen, 'LineWidth', 2);
             
-            h1 = line(ax, [cx-r+h, cx-r, cx-r+h], [cy-h, cy, cy+h], 'Color', 'w', 'LineWidth', 2); 
-            h2 = line(ax, [cx+r-h, cx+r, cx+r-h], [cy-h, cy, cy+h], 'Color', 'w', 'LineWidth', 2); 
-            h3 = line(ax, [cx-h, cx, cx+h], [cy-r+h, cy-r, cy-r+h], 'Color', 'w', 'LineWidth', 2); 
-            h4 = line(ax, [cx-h, cx, cx+h], [cy+r-h, cy+r, cy+r-h], 'Color', 'w', 'LineWidth', 2); 
+            h1 = line(ax, [cx-r+h, cx-r, cx-r+h], [cy-h, cy, cy+h], 'Color', brightGreen, 'LineWidth', 2); 
+            h2 = line(ax, [cx+r-h, cx+r, cx+r-h], [cy-h, cy, cy+h], 'Color', brightGreen, 'LineWidth', 2); 
+            h3 = line(ax, [cx-h, cx, cx+h], [cy-r+h, cy-r, cy-r+h], 'Color', brightGreen, 'LineWidth', 2); 
+            h4 = line(ax, [cx-h, cx, cx+h], [cy+r-h, cy+r, cy+r-h], 'Color', brightGreen, 'LineWidth', 2); 
             
             compassLines = [l1, l2, h1, h2, h3, h4];
             
-            tA = text(ax, cx, cy - r - pad, 'A', 'Color', 'w', 'FontSize', 12, 'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
-            tP = text(ax, cx, cy + r + pad, 'P', 'Color', 'w', 'FontSize', 12, 'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
-            tM = text(ax, cx - r - pad, cy, 'M', 'Color', 'w', 'FontSize', 12, 'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
-            tL = text(ax, cx + r + pad, cy, 'L', 'Color', 'w', 'FontSize', 12, 'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
+            tA = text(ax, cx, cy - r - pad, 'A', 'Color', brightGreen, 'FontSize', 12, 'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
+            tP = text(ax, cx, cy + r + pad, 'P', 'Color', brightGreen, 'FontSize', 12, 'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
+            tM = text(ax, cx - r - pad, cy, 'M', 'Color', brightGreen, 'FontSize', 12, 'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
+            tL = text(ax, cx + r + pad, cy, 'L', 'Color', brightGreen, 'FontSize', 12, 'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
             
             compassTexts = [tA, tP, tM, tL];
         else
             cx = xlims(2) - span;
             cy = ylims(1) + span;
             
-            l1 = line(ax, [cx-r, cx+r], [cy, cy], 'Color', 'w', 'LineWidth', 2);
-            l2 = line(ax, [cx, cx], [cy-r, cy+r], 'Color', 'w', 'LineWidth', 2);
+            l1 = line(ax, [cx-r, cx+r], [cy, cy], 'Color', brightGreen, 'LineWidth', 2);
+            l2 = line(ax, [cx, cx], [cy-r, cy+r], 'Color', brightGreen, 'LineWidth', 2);
             
-            h1 = line(ax, [cx-r+h, cx-r, cx-r+h], [cy-h, cy, cy+h], 'Color', 'w', 'LineWidth', 2);
-            h2 = line(ax, [cx+r-h, cx+r, cx+r-h], [cy-h, cy, cy+h], 'Color', 'w', 'LineWidth', 2);
-            h3 = line(ax, [cx-h, cx, cx+h], [cy-r+h, cy-r, cy-r+h], 'Color', 'w', 'LineWidth', 2);
-            h4 = line(ax, [cx-h, cx, cx+h], [cy+r-h, cy+r, cy+r-h], 'Color', 'w', 'LineWidth', 2);
+            h1 = line(ax, [cx-r+h, cx-r, cx-r+h], [cy-h, cy, cy+h], 'Color', brightGreen, 'LineWidth', 2);
+            h2 = line(ax, [cx+r-h, cx+r, cx+r-h], [cy-h, cy, cy+h], 'Color', brightGreen, 'LineWidth', 2);
+            h3 = line(ax, [cx-h, cx, cx+h], [cy-r+h, cy-r, cy-r+h], 'Color', brightGreen, 'LineWidth', 2);
+            h4 = line(ax, [cx-h, cx, cx+h], [cy+r-h, cy+r, cy+r-h], 'Color', brightGreen, 'LineWidth', 2);
             
             compassLines = [l1, l2, h1, h2, h3, h4];
             
-            tA = text(ax, cx, cy - r - pad, 'A', 'Color', 'w', 'FontSize', 12, 'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
-            tL = text(ax, cx + r + pad, cy, 'L', 'Color', 'w', 'FontSize', 12, 'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
-            tP = text(ax, cx, cy + r + pad, 'P', 'Color', 'w', 'FontSize', 12, 'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
-            tM = text(ax, cx - r - pad, cy, 'M', 'Color', 'w', 'FontSize', 12, 'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
+            tA = text(ax, cx, cy - r - pad, 'A', 'Color', brightGreen, 'FontSize', 12, 'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
+            tL = text(ax, cx + r + pad, cy, 'L', 'Color', brightGreen, 'FontSize', 12, 'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
+            tP = text(ax, cx, cy + r + pad, 'P', 'Color', brightGreen, 'FontSize', 12, 'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
+            tM = text(ax, cx - r - pad, cy, 'M', 'Color', brightGreen, 'FontSize', 12, 'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
             
             compassTexts = [tA, tL, tP, tM];
         end
